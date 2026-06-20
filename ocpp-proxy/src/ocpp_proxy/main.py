@@ -334,7 +334,7 @@ async def cleanup_app(app: web.Application) -> None:
 def main() -> None:
     """Entrypoint for the proxy server."""
     logging.basicConfig(level=logging.INFO)
-    app = asyncio.get_event_loop().run_until_complete(init_app())
+    app = asyncio.run(init_app())
     web.run_app(app, port=int(os.getenv("PORT", 9000)))
 
 
