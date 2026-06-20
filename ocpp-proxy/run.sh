@@ -6,5 +6,9 @@ bashio::log.info "Starting OCPP Proxy..."
 cd /app
 export PYTHONPATH=/app/src
 
-# Start the OCCP Proxy
+# Read port from add-on configuration
+export PORT=$(bashio::config 'port')
+bashio::log.info "Listening on port ${PORT}"
+
+# Start the OCPP Proxy
 exec python3 -m ocpp_proxy.main
