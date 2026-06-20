@@ -1,4 +1,7 @@
 import datetime
+import json
+import logging
+import os
 from typing import Any
 
 from ocpp.routing import on
@@ -7,6 +10,10 @@ from ocpp.v16 import call, call_result
 from ocpp.v16.enums import AuthorizationStatus, DataTransferStatus, RegistrationStatus
 
 from .charge_point_base import ChargePointBase
+
+_LOGGER = logging.getLogger(__name__)
+
+_STATE_FILE = os.environ.get("OCPP_STATE_FILE", "/data/ocpp_proxy_state.json")
 
 
 class ChargePointV16(ChargePointBase, OCPPChargePoint):
@@ -27,6 +34,46 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         # Stored so late-connecting backend services can receive a replay
         self.last_boot_payload: dict | None = None
         self.last_status_payload: dict | None = None
+        self.last_meter_payload: dict | None = None
+        self._load_persisted_state()
+
+    def _state_file_path(self) -> str:
+        """Return state file path; fall back to local dir if /data/ is not writable."""
+        if os.access(os.path.dirname(_STATE_FILE) or ".", os.W_OK):
+            return _STATE_FILE
+        return "ocpp_proxy_state.json"
+
+    def _load_persisted_state(self) -> None:
+        """Load last known payloads from disk (survives proxy restarts)."""
+        path = self._state_file_path()
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.last_boot_payload = data.get("last_boot_payload")
+            self.last_status_payload = data.get("last_status_payload")
+            self.last_meter_payload = data.get("last_meter_payload")
+            if self.last_boot_payload:
+                _LOGGER.info("Loaded persisted charger state from %s", path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            _LOGGER.debug("Could not load persisted state from %s", path)
+
+    def _persist_state(self) -> None:
+        """Write current payloads to disk so they survive proxy restarts."""
+        path = self._state_file_path()
+        try:
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "last_boot_payload": self.last_boot_payload,
+                        "last_status_payload": self.last_status_payload,
+                        "last_meter_payload": self.last_meter_payload,
+                    },
+                    f,
+                )
+        except Exception:
+            _LOGGER.debug("Could not persist state to %s", path)
 
     @property
     def ocpp_version(self) -> str:
@@ -79,6 +126,7 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
             "chargePointModel": charge_point_model,
             **{k: v for k, v in kwargs.items() if not k.startswith("_")},
         }
+        self._persist_state()
         event = {
             "type": "boot",
             "vendor": charge_point_vendor,
@@ -111,6 +159,7 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
             "status": status,
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         }
+        self._persist_state()
         event = {
             "type": "status",
             "connector_id": connector_id,
@@ -130,6 +179,11 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         self, connector_id: int, meter_value: list[Any], **kwargs: Any
     ) -> call_result.MeterValues:
         """Handle MeterValues and broadcast meter readings."""
+        self.last_meter_payload = {
+            "connectorId": connector_id,
+            "meterValue": meter_value,
+        }
+        self._persist_state()
         event = {
             "type": "meter",
             "connector_id": connector_id,

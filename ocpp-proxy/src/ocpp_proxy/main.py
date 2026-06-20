@@ -130,6 +130,11 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     # store active charge point in mutable state dict (avoids aiohttp DeprecationWarning)
     request.app["state"]["charge_point"] = cp
     _LOGGER.info(f"Charger connected using OCPP {cp.ocpp_version}")
+
+    # Replay stored boot/status/meter to any services that connected before the charger
+    if ocpp_service_manager:
+        asyncio.ensure_future(ocpp_service_manager.replay_to_connected_services(cp))
+
     read_task = asyncio.ensure_future(adapter._read_loop())
     try:
         await cp.start()

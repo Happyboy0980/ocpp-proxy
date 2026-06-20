@@ -234,6 +234,32 @@ class OCPPServiceManager:
 
         return False
 
+    async def replay_to_connected_services(self, cp: Any) -> None:
+        """Replay the last known BootNotification, StatusNotification and MeterValues to
+        every service that is currently connected.  Called when the charger (re)connects so
+        services that came online before the charger can initialise their entities."""
+        boot = getattr(cp, "last_boot_payload", None)
+        status = getattr(cp, "last_status_payload", None)
+        meter = getattr(cp, "last_meter_payload", None)
+        if not boot:
+            return
+        for service_id, client in list(self.services.items()):
+            if not client.connected:
+                continue
+            try:
+                await client.send_raw(json.dumps([2, str(uuid.uuid4()), "BootNotification", boot]))
+                if status:
+                    await client.send_raw(
+                        json.dumps([2, str(uuid.uuid4()), "StatusNotification", status])
+                    )
+                if meter:
+                    await client.send_raw(
+                        json.dumps([2, str(uuid.uuid4()), "MeterValues", meter])
+                    )
+                _LOGGER.info("[%s] Replayed boot/status/meter to already-connected service", service_id)
+            except Exception:
+                _LOGGER.debug("[%s] Could not replay to service on charger connect", service_id)
+
     async def forward_raw_to_services(self, raw_msg: str) -> None:
         """Forward a raw OCPP message from the charger to every connected backend service."""
         for client in list(self.services.values()):
