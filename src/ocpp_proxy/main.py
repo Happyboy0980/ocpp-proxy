@@ -65,7 +65,9 @@ class AiohttpWSAdapter:
         """
         new_id = str(uuid.uuid4())
         self._service_call_map[new_id] = (service_conn, original_id)
-        await self._ws.send_str(json.dumps([2, new_id, action, payload]))
+        msg = json.dumps([2, new_id, action, payload])
+        _LOGGER.debug("proxy→charger  [%s] %s", action, msg)
+        await self._ws.send_str(msg)
 
     async def _read_loop(self) -> None:
         try:
@@ -82,13 +84,17 @@ class AiohttpWSAdapter:
                                 service_conn, orig_id = self._service_call_map.pop(unique_id)
                                 # Return to service with the original ID
                                 response = [msg_type, orig_id] + list(parsed[2:])
+                                resp_str = json.dumps(response)
+                                _LOGGER.debug("charger→service (response): %s", resp_str)
                                 try:
-                                    await service_conn.send(json.dumps(response))
+                                    await service_conn.send(resp_str)
                                 except Exception:
                                     pass
                                 intercepted = True
                             # Forward every CALL from the charger to backend services
                             if msg_type == 2:
+                                action = parsed[2] if len(parsed) > 2 else "?"
+                                _LOGGER.debug("charger→services [%s]: %s", action, msg.data)
                                 for cb in self._raw_forward_cbs:
                                     asyncio.create_task(cb(msg.data))
                     except Exception:
@@ -338,7 +344,8 @@ async def cleanup_app(app: web.Application) -> None:
 
 def main() -> None:
     """Entrypoint for the proxy server."""
-    logging.basicConfig(level=logging.INFO)
+    log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.DEBUG))
     app = asyncio.run(init_app())
     web.run_app(app, port=int(os.getenv("PORT", 9000)))
 

@@ -49,6 +49,7 @@ class RawOCPPServiceClient:
     async def send_raw(self, raw_msg: str) -> None:
         """Forward a raw OCPP message (from the charger) to this backend service."""
         try:
+            _LOGGER.debug("[%s] charger→service: %s", self.service_id, raw_msg)
             await self._connection.send(raw_msg)
         except Exception:
             _LOGGER.exception(f"[{self.service_id}] Failed to forward raw message")
@@ -66,6 +67,7 @@ class RawOCPPServiceClient:
         try:
             async for raw_msg in self._connection:
                 try:
+                    _LOGGER.debug("[%s] service→proxy: %s", self.service_id, raw_msg)
                     msg = json.loads(raw_msg)
                     if not isinstance(msg, list) or len(msg) < 2:
                         continue
