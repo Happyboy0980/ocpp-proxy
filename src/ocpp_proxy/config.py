@@ -1,3 +1,4 @@
+import json
 import os
 
 import yaml
@@ -6,17 +7,36 @@ import yaml
 class Config:
     """
     Load configuration from Home Assistant add-on options or standalone YAML file.
+
+    HA Supervisor stores add-on options as JSON at /data/options.json.
+    For standalone / development use a YAML file can be provided via the
+    ADDON_CONFIG_FILE environment variable or the constructor argument.
     """
 
     def __init__(self, path: str | None = None):
-        # Home Assistant add-on options are stored in /data/options.yaml by default
-        default_path = os.getenv("ADDON_CONFIG_FILE", "/data/options.yaml")
-        config_path = path or default_path
+        if path:
+            # Explicit path (tests / development) — detect format by extension
+            self._cfg = self._load_file(path)
+        else:
+            # HA add-on: try JSON first, then fall back to YAML
+            json_path = "/data/options.json"
+            yaml_path = os.getenv("ADDON_CONFIG_FILE", "/data/options.yaml")
+            if os.path.exists(json_path):
+                self._cfg = self._load_file(json_path)
+            elif os.path.exists(yaml_path):
+                self._cfg = self._load_file(yaml_path)
+            else:
+                self._cfg = {}
+
+    @staticmethod
+    def _load_file(path: str) -> dict:
         try:
-            with open(config_path) as f:
-                self._cfg = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            self._cfg = {}
+            with open(path) as f:
+                if path.endswith(".json"):
+                    return json.load(f) or {}
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
 
     @property
     def allow_shared_charging(self) -> bool:
