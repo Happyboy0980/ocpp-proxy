@@ -127,8 +127,8 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
         event_logger=request.app["event_logger"],
         auto_detect=config.auto_detect_ocpp_version,
     )
-    # store active charge point for proxying control requests
-    request.app["charge_point"] = cp
+    # store active charge point in mutable state dict (avoids aiohttp DeprecationWarning)
+    request.app["state"]["charge_point"] = cp
     _LOGGER.info(f"Charger connected using OCPP {cp.ocpp_version}")
     read_task = asyncio.ensure_future(adapter._read_loop())
     try:
@@ -251,7 +251,7 @@ async def backend_handler(request: web.Request) -> web.WebSocketResponse:
             if msg.type == web.WSMsgType.TEXT:
                 data = msg.json()
                 action = data.get("action")
-                cp = request.app.get("charge_point")
+                cp = request.app["state"].get("charge_point")
                 # Remote start request
                 if action == "RemoteStartTransaction" and cp:
                     allowed = await manager.request_control(backend_id)
@@ -295,8 +295,8 @@ async def init_app() -> web.Application:
     app["ha_bridge"] = ha
     app["event_logger"] = EventLogger(db_path=os.getenv("LOG_DB_PATH", "usage_log.db"))
     app["ocpp_service_manager"] = ocpp_service_manager
-    # Pre-initialise so handlers can update it without triggering aiohttp deprecation warnings
-    app["charge_point"] = None
+    # Mutable state dict — updated by handlers without modifying the frozen app dict
+    app["state"] = {"charge_point": None}
 
     # Set app reference for backend manager
     app["backend_manager"].set_app_reference(app)

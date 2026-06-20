@@ -40,7 +40,7 @@ class RawOCPPServiceClient:
     def _get_adapter(self) -> Any:
         """Return the AiohttpWSAdapter for the currently connected charger, or None."""
         try:
-            cp = self._service_manager.backend_manager._app["charge_point"]
+            cp = self._service_manager.backend_manager._app["state"]["charge_point"]
             return cp.connection  # ChargePointBase stores adapter as self.connection
         except Exception:
             return None
@@ -200,7 +200,7 @@ class OCPPServiceManager:
 
         if success and hasattr(self.backend_manager, "_app"):
             # Forward the request to the charge point
-            cp = self.backend_manager._app.get("charge_point")
+            cp = self.backend_manager._app["state"].get("charge_point")
             if cp:
                 try:
                     if action == "RemoteStartTransaction":
