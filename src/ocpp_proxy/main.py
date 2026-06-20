@@ -141,6 +141,11 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     if ocpp_service_manager:
         asyncio.ensure_future(ocpp_service_manager.replay_to_connected_services(cp))
 
+    # Always ask the charger to re-send BootNotification + StatusNotification so HA's
+    # full configuration chain (GetConfiguration → ChangeConfiguration → frequent
+    # MeterValues with all measurands) is triggered on every (re)connect.
+    asyncio.ensure_future(cp.request_fresh_boot_and_status())
+
     read_task = asyncio.ensure_future(adapter._read_loop())
     try:
         await cp.start()

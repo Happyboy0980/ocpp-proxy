@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 import logging
@@ -7,7 +8,7 @@ from typing import Any
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as OCPPChargePoint
 from ocpp.v16 import call, call_result
-from ocpp.v16.enums import AuthorizationStatus, DataTransferStatus, RegistrationStatus
+from ocpp.v16.enums import AuthorizationStatus, DataTransferStatus, MessageTrigger, RegistrationStatus
 
 from .charge_point_base import ChargePointBase
 
@@ -79,6 +80,32 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
     def ocpp_version(self) -> str:
         """Return the OCPP version this implementation supports."""
         return "1.6"
+
+    async def request_fresh_boot_and_status(self) -> None:
+        """Ask the charger to re-send BootNotification and StatusNotification.
+
+        This triggers HA's full configuration chain (GetConfiguration →
+        ChangeConfiguration for measurands/sample interval) which makes all
+        sensor entities populate with real values.
+        """
+        await asyncio.sleep(2)  # Allow cp.start() receive loop to begin
+        try:
+            resp = await self.call(
+                call.TriggerMessage(requested_message=MessageTrigger.boot_notification)
+            )
+            _LOGGER.info("TriggerMessage(BootNotification) accepted: %s", resp)
+        except Exception as exc:
+            _LOGGER.debug("TriggerMessage(BootNotification) failed: %s", exc)
+        try:
+            resp = await self.call(
+                call.TriggerMessage(
+                    requested_message=MessageTrigger.status_notification,
+                    connector_id=1,
+                )
+            )
+            _LOGGER.info("TriggerMessage(StatusNotification) accepted: %s", resp)
+        except Exception as exc:
+            _LOGGER.debug("TriggerMessage(StatusNotification) failed: %s", exc)
 
     async def start(self) -> None:
         """Start the OCPP message handler loop (CSMS role)."""
