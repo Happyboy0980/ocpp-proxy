@@ -317,6 +317,9 @@ async def init_app() -> web.Application:
 
     # Set app reference for backend manager
     app["backend_manager"].set_app_reference(app)
+    # Give ocpp_service_manager its backend_manager reference
+    # (needed so _get_adapter() can route service CALLs to the charger)
+    ocpp_service_manager.backend_manager = app["backend_manager"]
 
     app.add_routes(
         [

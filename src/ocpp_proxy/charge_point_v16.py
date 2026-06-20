@@ -149,11 +149,16 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         **kwargs: Any,
     ) -> call_result.BootNotification:
         """Handle BootNotification request from charger."""
+        # Store with camelCase keys so the replay to backend services is valid OCPP JSON
         self.last_boot_payload = {
             "chargePointVendor": charge_point_vendor,
             "chargePointModel": charge_point_model,
-            **{k: v for k, v in kwargs.items() if not k.startswith("_")},
         }
+        for k, v in kwargs.items():
+            if not k.startswith("_") and v is not None:
+                # ocpp library passes kwargs in snake_case; convert back to camelCase
+                camel = "".join(w.capitalize() if i else w for i, w in enumerate(k.split("_")))
+                self.last_boot_payload[camel] = v
         self._persist_state()
         event = {
             "type": "boot",
@@ -207,6 +212,7 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         self, connector_id: int, meter_value: list[Any], **kwargs: Any
     ) -> call_result.MeterValues:
         """Handle MeterValues and broadcast meter readings."""
+        # Store with camelCase key so replay is valid OCPP JSON (sampledValue not sampled_value)
         self.last_meter_payload = {
             "connectorId": connector_id,
             "meterValue": meter_value,
