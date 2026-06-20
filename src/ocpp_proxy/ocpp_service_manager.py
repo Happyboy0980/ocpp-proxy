@@ -83,8 +83,14 @@ class RawOCPPServiceClient:
                                 self._connection, unique_id, action, payload
                             )
                         else:
+                            # Charger not yet connected — return a CALLRESULT with status
+                            # "Rejected" (valid OCPP response) instead of a CALLERROR so
+                            # the backend service handles it gracefully.
+                            _LOGGER.debug(
+                                "[%s] charger not connected, rejecting %s", self.service_id, action
+                            )
                             await self._connection.send(
-                                json.dumps([4, unique_id, "InternalError", "No charger connected", {}])
+                                json.dumps([3, unique_id, {"status": "Rejected"}])
                             )
                     # msg_type 3 / 4: responses to our forwarded events — discard silently
                 except Exception:
