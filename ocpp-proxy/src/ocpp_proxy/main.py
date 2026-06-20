@@ -4,7 +4,7 @@ import io
 import logging
 import os
 
-from aiohttp import WSCloseCode, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from .backend_manager import BackendManager
 from .charge_point_factory import ChargePointFactory
@@ -14,6 +14,37 @@ from .logger import EventLogger
 from .ocpp_service_manager import OCPPServiceManager
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _WebSocketClosed(Exception):
+    pass
+
+
+class AiohttpWSAdapter:
+    """Adapt aiohttp WebSocketResponse to the recv/send interface expected by the ocpp library."""
+
+    def __init__(self, ws: web.WebSocketResponse) -> None:
+        self._ws = ws
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    async def recv(self) -> str:
+        msg = await self._queue.get()
+        if msg is None:
+            raise _WebSocketClosed()
+        return msg
+
+    async def send(self, data: str) -> None:
+        await self._ws.send_str(data)
+
+    async def _read_loop(self) -> None:
+        try:
+            async for msg in self._ws:
+                if msg.type == WSMsgType.TEXT:
+                    await self._queue.put(msg.data)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
+                    break
+        finally:
+            await self._queue.put(None)
 
 
 async def charger_handler(request: web.Request) -> web.WebSocketResponse:
@@ -26,9 +57,10 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     cp_id = path_segments[-1] if path_segments else "CP-1"
 
     config = request.app["config"]
+    adapter = AiohttpWSAdapter(ws)
     cp = ChargePointFactory.create_charge_point(
         cp_id,
-        ws,
+        adapter,
         version=config.ocpp_version,
         manager=request.app["backend_manager"],
         ha_bridge=request.app["ha_bridge"],
@@ -38,11 +70,19 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     # store active charge point for proxying control requests
     request.app["charge_point"] = cp
     _LOGGER.info(f"Charger connected using OCPP {cp.ocpp_version}")
+    read_task = asyncio.ensure_future(adapter._read_loop())
     try:
         await cp.start()
+    except _WebSocketClosed:
+        pass
     except Exception:
         _LOGGER.exception("Charger handler error")
     finally:
+        read_task.cancel()
+        try:
+            await read_task
+        except asyncio.CancelledError:
+            pass
         await ws.close(code=WSCloseCode.GOING_AWAY)
     return ws
 
