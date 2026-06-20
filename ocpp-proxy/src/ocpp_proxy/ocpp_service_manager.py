@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 import websockets
@@ -167,6 +168,21 @@ class OCPPServiceManager:
             self._connection_tasks[service_id] = task
 
             _LOGGER.info(f"Connecting to OCPP {version} service {service_id} at {url}")
+
+            # If charger is already online, replay its last BootNotification and
+            # StatusNotification so the backend service initialises correctly
+            try:
+                cp = self.backend_manager._app["state"].get("charge_point")
+                if cp and getattr(cp, "last_boot_payload", None):
+                    await client.send_raw(
+                        json.dumps([2, str(uuid.uuid4()), "BootNotification", cp.last_boot_payload])
+                    )
+                if cp and getattr(cp, "last_status_payload", None):
+                    await client.send_raw(
+                        json.dumps([2, str(uuid.uuid4()), "StatusNotification", cp.last_status_payload])
+                    )
+            except Exception:
+                _LOGGER.debug(f"[{service_id}] Could not replay boot/status to new service")
 
         except Exception:
             _LOGGER.exception(f"Failed to connect to OCPP service {service_id}")

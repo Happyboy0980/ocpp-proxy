@@ -24,6 +24,9 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
     ) -> None:
         ChargePointBase.__init__(self, cp_id, connection, manager, ha_bridge, event_logger)
         OCPPChargePoint.__init__(self, cp_id, connection)
+        # Stored so late-connecting backend services can receive a replay
+        self.last_boot_payload: dict | None = None
+        self.last_status_payload: dict | None = None
 
     @property
     def ocpp_version(self) -> str:
@@ -71,6 +74,11 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         **kwargs: Any,
     ) -> call_result.BootNotification:
         """Handle BootNotification request from charger."""
+        self.last_boot_payload = {
+            "chargePointVendor": charge_point_vendor,
+            "chargePointModel": charge_point_model,
+            **{k: v for k, v in kwargs.items() if not k.startswith("_")},
+        }
         event = {
             "type": "boot",
             "vendor": charge_point_vendor,
@@ -97,6 +105,12 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         self, connector_id: int, error_code: str, status: str, **kwargs: Any
     ) -> call_result.StatusNotification:
         """Handle StatusNotification, broadcast and enforce safety on faults."""
+        self.last_status_payload = {
+            "connectorId": connector_id,
+            "errorCode": error_code,
+            "status": status,
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
         event = {
             "type": "status",
             "connector_id": connector_id,
