@@ -1,5 +1,8 @@
 import asyncio
+import datetime
+import json
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 import websockets
@@ -9,9 +12,45 @@ if TYPE_CHECKING:
 else:
     Subprotocol = str
 
-from .charge_point_factory import OCPPServiceFactory
-
 _LOGGER = logging.getLogger(__name__)
+
+
+class RawOCPPServiceClient:
+    """Outbound OCPP client that forwards charger events as raw OCPP JSON messages."""
+
+    def __init__(self, service_id: str, connection: Any, version: str = "1.6") -> None:
+        self.service_id = service_id
+        self._connection = connection
+        self.version = version
+        self.connected = True
+
+    def _call_msg(self, action: str, payload: dict) -> str:
+        return json.dumps([2, str(uuid.uuid4()), action, payload])
+
+    async def send_call(self, action: str, payload: dict) -> None:
+        """Send an OCPP CALL message to the backend (fire-and-forget)."""
+        try:
+            await self._connection.send(self._call_msg(action, payload))
+        except Exception:
+            _LOGGER.exception(f"[{self.service_id}] Failed to send {action}")
+            self.connected = False
+
+    async def start(self) -> None:
+        """Listen for incoming commands from the backend OCPP server."""
+        try:
+            async for raw_msg in self._connection:
+                try:
+                    msg = json.loads(raw_msg)
+                    if not isinstance(msg, list) or len(msg) < 3:
+                        continue
+                    if msg[0] == 2:  # CALL from backend — acknowledge with empty response
+                        await self._connection.send(json.dumps([3, msg[1], {}]))
+                except Exception:
+                    _LOGGER.debug(f"[{self.service_id}] Error parsing backend message")
+        except Exception:
+            _LOGGER.info(f"[{self.service_id}] Connection closed")
+        finally:
+            self.connected = False
 
 
 class OCPPServiceManager:
@@ -81,10 +120,8 @@ class OCPPServiceManager:
                 ping_timeout=10,
             )
 
-            # Create OCPP client using factory
-            client = OCPPServiceFactory.create_service_client(
-                service_id, connection, version, manager=self
-            )
+            # Create raw OCPP service client
+            client = RawOCPPServiceClient(service_id, connection, version)
             self.services[service_id] = client
 
             # Start the client in a background task
@@ -153,31 +190,44 @@ class OCPPServiceManager:
                 task.add_done_callback(self._background_tasks.discard)
 
     async def _send_event_to_service(self, client: Any, event: dict[str, Any]) -> None:
-        """Send a specific event to an OCPP service."""
+        """Forward a charger event to an outbound OCPP service as an OCPP CALL."""
+        event_type = event.get("type")
         try:
-            event_type = event.get("type")
-
-            # The ChargePoint implementations handle the actual message sending
-            # We just need to forward the events to the service clients
-            if event_type == "status":
-                # Services receive status updates passively
-                pass
+            if event_type == "boot":
+                await client.send_call("BootNotification", {
+                    "chargePointVendor": event.get("vendor", "Unknown"),
+                    "chargePointModel": event.get("model", "Unknown"),
+                })
+            elif event_type == "status":
+                await client.send_call("StatusNotification", {
+                    "connectorId": event.get("connector_id", 0),
+                    "errorCode": event.get("error_code", "NoError"),
+                    "status": event.get("status", "Available"),
+                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+                })
             elif event_type == "meter":
-                # Services receive meter values passively
-                pass
-            elif event_type == "transaction_started" or event_type == "transaction_stopped":
-                # Services receive transaction events passively
-                pass
+                await client.send_call("MeterValues", {
+                    "connectorId": event.get("connector_id", 0),
+                    "meterValue": event.get("values", []),
+                })
             elif event_type == "heartbeat":
-                # Services receive heartbeat events passively
-                pass
-            elif event_type == "boot":
-                # Services receive boot notifications passively
-                pass
-
+                await client.send_call("Heartbeat", {})
+            elif event_type == "transaction_started":
+                await client.send_call("StartTransaction", {
+                    "connectorId": event.get("connector_id", 1),
+                    "idTag": event.get("id_tag", ""),
+                    "meterStart": event.get("meter_start", 0),
+                    "timestamp": event.get("timestamp", ""),
+                })
+            elif event_type == "transaction_stopped":
+                await client.send_call("StopTransaction", {
+                    "transactionId": event.get("transaction_id", 0),
+                    "meterStop": event.get("meter_stop", 0),
+                    "timestamp": event.get("timestamp", ""),
+                })
         except Exception:
             _LOGGER.exception(
-                f"Error sending event to service {getattr(client, 'service_id', 'unknown')}"
+                f"Error forwarding {event_type} to service {getattr(client, 'service_id', 'unknown')}"
             )
 
     async def stop_all_services(self) -> None:
