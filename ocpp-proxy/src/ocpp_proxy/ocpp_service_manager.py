@@ -1,8 +1,6 @@
 import asyncio
-import datetime
 import json
 import logging
-import uuid
 from typing import TYPE_CHECKING, Any, cast
 
 import websockets
@@ -16,7 +14,15 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class RawOCPPServiceClient:
-    """Outbound OCPP client that forwards charger events as raw OCPP JSON messages."""
+    """Outbound OCPP client — true transparent proxy between the charger and a backend OCPP server.
+
+    Charger → service : every raw CALL from the charger is forwarded unchanged by
+    OCPPServiceManager.forward_raw_to_services(), which calls send_raw() on each client.
+
+    Service → charger : every CALL from the service is forwarded to the charger via
+    AiohttpWSAdapter.proxy_call_to_charger(), which remaps the unique ID so the charger's
+    CALLRESULT is intercepted and returned to this service using the original ID.
+    """
 
     def __init__(
         self,
@@ -31,77 +37,53 @@ class RawOCPPServiceClient:
         self.connected = True
         self._service_manager = service_manager
 
-    def _call_msg(self, action: str, payload: dict) -> str:
-        return json.dumps([2, str(uuid.uuid4()), action, payload])
-
-    async def send_call(self, action: str, payload: dict) -> None:
-        """Send an OCPP CALL message to the backend (fire-and-forget)."""
+    def _get_adapter(self) -> Any:
+        """Return the AiohttpWSAdapter for the currently connected charger, or None."""
         try:
-            await self._connection.send(self._call_msg(action, payload))
-        except Exception:
-            _LOGGER.exception(f"[{self.service_id}] Failed to send {action}")
-            self.connected = False
-
-    def _get_charge_point(self) -> Any:
-        """Return the active ChargePoint instance, if any."""
-        try:
-            return self._service_manager.backend_manager._app["charge_point"]
+            cp = self._service_manager.backend_manager._app["charge_point"]
+            return cp.connection  # ChargePointBase stores adapter as self.connection
         except Exception:
             return None
 
-    async def _handle_backend_call(self, unique_id: str, action: str, payload: dict) -> None:
-        """Forward a CALL from the backend to the physical charger."""
-        cp = self._get_charge_point()
-        if cp is None:
-            await self._connection.send(
-                json.dumps([4, unique_id, "InternalError", "No charger connected", {}])
-            )
-            return
-
+    async def send_raw(self, raw_msg: str) -> None:
+        """Forward a raw OCPP message (from the charger) to this backend service."""
         try:
-            if action == "RemoteStartTransaction":
-                ok = await cp.send_remote_start_transaction(
-                    payload.get("connectorId", 1),
-                    payload.get("idTag", ""),
-                )
-                status = "Accepted" if ok else "Rejected"
-                await self._connection.send(json.dumps([3, unique_id, {"status": status}]))
-
-            elif action == "RemoteStopTransaction":
-                ok = await cp.send_remote_stop_transaction(
-                    payload.get("transactionId", 0),
-                )
-                status = "Accepted" if ok else "Rejected"
-                await self._connection.send(json.dumps([3, unique_id, {"status": status}]))
-
-            elif action == "Reset":
-                _LOGGER.info(f"[{self.service_id}] Reset requested by backend — not yet forwarded")
-                await self._connection.send(json.dumps([3, unique_id, {"status": "Rejected"}]))
-
-            else:
-                _LOGGER.debug(f"[{self.service_id}] Unhandled backend command: {action}")
-                await self._connection.send(json.dumps([3, unique_id, {"status": "NotImplemented"}]))
-
+            await self._connection.send(raw_msg)
         except Exception:
-            _LOGGER.exception(f"[{self.service_id}] Error handling backend command {action}")
-            await self._connection.send(
-                json.dumps([4, unique_id, "InternalError", "Command failed", {}])
-            )
+            _LOGGER.exception(f"[{self.service_id}] Failed to forward raw message")
+            self.connected = False
 
     async def start(self) -> None:
-        """Listen for incoming commands from the backend OCPP server."""
+        """Listen for incoming messages from the backend OCPP server.
+
+        Type-2 (CALL) messages are forwarded to the physical charger via the adapter's
+        proxy_call_to_charger(), which handles ID remapping and response routing.
+        Type-3/4 messages (CALLRESULT/CALLERROR) arriving here are responses the backend
+        sent to our forwarded charger events — they are silently discarded since the proxy
+        already replied to those events on the charger side.
+        """
         try:
             async for raw_msg in self._connection:
                 try:
                     msg = json.loads(raw_msg)
-                    if not isinstance(msg, list) or len(msg) < 3:
+                    if not isinstance(msg, list) or len(msg) < 2:
                         continue
-                    if msg[0] == 2:  # CALL from backend
+                    msg_type = msg[0]
+                    if msg_type == 2:  # CALL from backend → forward to charger
                         unique_id = msg[1]
-                        action = msg[2]
-                        call_payload = msg[3] if len(msg) > 3 else {}
+                        action = msg[2] if len(msg) > 2 else ""
+                        payload = msg[3] if len(msg) > 3 else {}
                         _LOGGER.info(f"[{self.service_id}] Backend command: {action}")
-                        await self._handle_backend_call(unique_id, action, call_payload)
+                        adapter = self._get_adapter()
+                        if adapter:
+                            await adapter.proxy_call_to_charger(
+                                self._connection, unique_id, action, payload
+                            )
+                        else:
+                            await self._connection.send(
+                                json.dumps([4, unique_id, "InternalError", "No charger connected", {}])
+                            )
+                    # msg_type 3 / 4: responses to our forwarded events — discard silently
                 except Exception:
                     _LOGGER.debug(f"[{self.service_id}] Error parsing backend message")
         except Exception:
@@ -122,7 +104,6 @@ class OCPPServiceManager:
         self.backend_manager = backend_manager
         self.services: dict[str, Any] = {}
         self._connection_tasks: dict[str, asyncio.Task[Any]] = {}
-        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     async def start_services(self) -> None:
         """Start connections to all configured OCPP services."""
@@ -237,55 +218,11 @@ class OCPPServiceManager:
 
         return False
 
-    def broadcast_event_to_services(self, event: dict[str, Any]) -> None:
-        """Broadcast charger events to all connected OCPP services."""
-        for client in self.services.values():
-            if hasattr(client, "connected") and client.connected:
-                task = asyncio.create_task(self._send_event_to_service(client, event))
-                # Store reference to prevent task being garbage collected
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-
-    async def _send_event_to_service(self, client: Any, event: dict[str, Any]) -> None:
-        """Forward a charger event to an outbound OCPP service as an OCPP CALL."""
-        event_type = event.get("type")
-        try:
-            if event_type == "boot":
-                await client.send_call("BootNotification", {
-                    "chargePointVendor": event.get("vendor", "Unknown"),
-                    "chargePointModel": event.get("model", "Unknown"),
-                })
-            elif event_type == "status":
-                await client.send_call("StatusNotification", {
-                    "connectorId": event.get("connector_id", 0),
-                    "errorCode": event.get("error_code", "NoError"),
-                    "status": event.get("status", "Available"),
-                    "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-                })
-            elif event_type == "meter":
-                await client.send_call("MeterValues", {
-                    "connectorId": event.get("connector_id", 0),
-                    "meterValue": event.get("values", []),
-                })
-            elif event_type == "heartbeat":
-                await client.send_call("Heartbeat", {})
-            elif event_type == "transaction_started":
-                await client.send_call("StartTransaction", {
-                    "connectorId": event.get("connector_id", 1),
-                    "idTag": event.get("id_tag", ""),
-                    "meterStart": event.get("meter_start", 0),
-                    "timestamp": event.get("timestamp", ""),
-                })
-            elif event_type == "transaction_stopped":
-                await client.send_call("StopTransaction", {
-                    "transactionId": event.get("transaction_id", 0),
-                    "meterStop": event.get("meter_stop", 0),
-                    "timestamp": event.get("timestamp", ""),
-                })
-        except Exception:
-            _LOGGER.exception(
-                f"Error forwarding {event_type} to service {getattr(client, 'service_id', 'unknown')}"
-            )
+    async def forward_raw_to_services(self, raw_msg: str) -> None:
+        """Forward a raw OCPP message from the charger to every connected backend service."""
+        for client in list(self.services.values()):
+            if getattr(client, "connected", False):
+                asyncio.create_task(client.send_raw(raw_msg))
 
     async def stop_all_services(self) -> None:
         """Stop all OCPP service connections."""

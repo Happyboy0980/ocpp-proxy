@@ -1,8 +1,11 @@
 import asyncio
 import csv
 import io
+import json
 import logging
 import os
+import uuid
+from typing import Any
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -21,11 +24,22 @@ class _WebSocketClosed(Exception):
 
 
 class AiohttpWSAdapter:
-    """Adapt aiohttp WebSocketResponse to the recv/send interface expected by the ocpp library."""
+    """Adapt aiohttp WebSocketResponse to the recv/send interface expected by the ocpp library.
+
+    Also acts as the transparent proxy layer:
+    - Every CALL (type 2) from the charger is forwarded raw to all registered service callbacks.
+    - Every CALL from a backend service is forwarded raw to the charger with a new unique ID;
+      the charger's CALLRESULT/CALLERROR is intercepted and returned to the originating service
+      using the original ID, keeping the ocpp library unaware of these passthrough calls.
+    """
 
     def __init__(self, ws: web.WebSocketResponse) -> None:
         self._ws = ws
         self._queue: asyncio.Queue = asyncio.Queue()
+        # Callbacks invoked with every raw CALL (type 2) received from the charger
+        self._raw_forward_cbs: list = []
+        # Map: proxy-generated unique_id → (service_connection, original_unique_id)
+        self._service_call_map: dict[str, tuple] = {}
 
     async def recv(self) -> str:
         msg = await self._queue.get()
@@ -36,11 +50,51 @@ class AiohttpWSAdapter:
     async def send(self, data: str) -> None:
         await self._ws.send_str(data)
 
+    def add_raw_forward_cb(self, cb: Any) -> None:
+        """Register a coroutine callback to receive every raw CALL from the charger."""
+        self._raw_forward_cbs.append(cb)
+
+    async def proxy_call_to_charger(
+        self, service_conn: Any, original_id: str, action: str, payload: dict
+    ) -> None:
+        """Send a CALL to the charger on behalf of a backend service.
+
+        Generates a fresh unique ID, stores the ID mapping, then sends the raw
+        OCPP message.  When the charger replies the response is intercepted in
+        _read_loop and returned to *service_conn* using *original_id*.
+        """
+        new_id = str(uuid.uuid4())
+        self._service_call_map[new_id] = (service_conn, original_id)
+        await self._ws.send_str(json.dumps([2, new_id, action, payload]))
+
     async def _read_loop(self) -> None:
         try:
             async for msg in self._ws:
                 if msg.type == WSMsgType.TEXT:
-                    await self._queue.put(msg.data)
+                    intercepted = False
+                    try:
+                        parsed = json.loads(msg.data)
+                        if isinstance(parsed, list) and len(parsed) >= 2:
+                            msg_type = parsed[0]
+                            unique_id = parsed[1]
+                            # CALLRESULT (3) or CALLERROR (4) for a service-proxied call
+                            if msg_type in (3, 4) and unique_id in self._service_call_map:
+                                service_conn, orig_id = self._service_call_map.pop(unique_id)
+                                # Return to service with the original ID
+                                response = [msg_type, orig_id] + list(parsed[2:])
+                                try:
+                                    await service_conn.send(json.dumps(response))
+                                except Exception:
+                                    pass
+                                intercepted = True
+                            # Forward every CALL from the charger to backend services
+                            if msg_type == 2:
+                                for cb in self._raw_forward_cbs:
+                                    asyncio.create_task(cb(msg.data))
+                    except Exception:
+                        pass
+                    if not intercepted:
+                        await self._queue.put(msg.data)
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
         finally:
@@ -58,6 +112,12 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
 
     config = request.app["config"]
     adapter = AiohttpWSAdapter(ws)
+
+    # Register service manager so every charger CALL is forwarded raw to backend services
+    ocpp_service_manager = request.app.get("ocpp_service_manager")
+    if ocpp_service_manager:
+        adapter.add_raw_forward_cb(ocpp_service_manager.forward_raw_to_services)
+
     cp = ChargePointFactory.create_charge_point(
         cp_id,
         adapter,
