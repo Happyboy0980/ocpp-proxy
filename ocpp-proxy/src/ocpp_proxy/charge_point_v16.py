@@ -88,14 +88,15 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         ChangeConfiguration for measurands/sample interval) which makes all
         sensor entities populate with real values.
         """
+        _LOGGER.info("Requesting fresh BootNotification + StatusNotification from charger...")
         await asyncio.sleep(2)  # Allow cp.start() receive loop to begin
         try:
             resp = await self.call(
                 call.TriggerMessage(requested_message=MessageTrigger.boot_notification)
             )
-            _LOGGER.info("TriggerMessage(BootNotification) accepted: %s", resp)
+            _LOGGER.info("TriggerMessage(BootNotification) → %s", resp)
         except Exception as exc:
-            _LOGGER.debug("TriggerMessage(BootNotification) failed: %s", exc)
+            _LOGGER.warning("TriggerMessage(BootNotification) failed: %s", exc)
         try:
             resp = await self.call(
                 call.TriggerMessage(
@@ -103,9 +104,9 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
                     connector_id=1,
                 )
             )
-            _LOGGER.info("TriggerMessage(StatusNotification) accepted: %s", resp)
+            _LOGGER.info("TriggerMessage(StatusNotification) → %s", resp)
         except Exception as exc:
-            _LOGGER.debug("TriggerMessage(StatusNotification) failed: %s", exc)
+            _LOGGER.warning("TriggerMessage(StatusNotification) failed: %s", exc)
 
     async def start(self) -> None:
         """Start the OCPP message handler loop (CSMS role)."""

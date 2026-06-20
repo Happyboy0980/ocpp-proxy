@@ -48,6 +48,7 @@ class AiohttpWSAdapter:
         return msg
 
     async def send(self, data: str) -> None:
+        _LOGGER.debug("proxy→charger: %s", data)
         await self._ws.send_str(data)
 
     def add_raw_forward_cb(self, cb: Any) -> None:
