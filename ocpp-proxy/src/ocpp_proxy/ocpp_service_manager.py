@@ -18,11 +18,18 @@ _LOGGER = logging.getLogger(__name__)
 class RawOCPPServiceClient:
     """Outbound OCPP client that forwards charger events as raw OCPP JSON messages."""
 
-    def __init__(self, service_id: str, connection: Any, version: str = "1.6") -> None:
+    def __init__(
+        self,
+        service_id: str,
+        connection: Any,
+        version: str = "1.6",
+        service_manager: Any = None,
+    ) -> None:
         self.service_id = service_id
         self._connection = connection
         self.version = version
         self.connected = True
+        self._service_manager = service_manager
 
     def _call_msg(self, action: str, payload: dict) -> str:
         return json.dumps([2, str(uuid.uuid4()), action, payload])
@@ -35,6 +42,52 @@ class RawOCPPServiceClient:
             _LOGGER.exception(f"[{self.service_id}] Failed to send {action}")
             self.connected = False
 
+    def _get_charge_point(self) -> Any:
+        """Return the active ChargePoint instance, if any."""
+        try:
+            return self._service_manager.backend_manager._app["charge_point"]
+        except Exception:
+            return None
+
+    async def _handle_backend_call(self, unique_id: str, action: str, payload: dict) -> None:
+        """Forward a CALL from the backend to the physical charger."""
+        cp = self._get_charge_point()
+        if cp is None:
+            await self._connection.send(
+                json.dumps([4, unique_id, "InternalError", "No charger connected", {}])
+            )
+            return
+
+        try:
+            if action == "RemoteStartTransaction":
+                ok = await cp.send_remote_start_transaction(
+                    payload.get("connectorId", 1),
+                    payload.get("idTag", ""),
+                )
+                status = "Accepted" if ok else "Rejected"
+                await self._connection.send(json.dumps([3, unique_id, {"status": status}]))
+
+            elif action == "RemoteStopTransaction":
+                ok = await cp.send_remote_stop_transaction(
+                    payload.get("transactionId", 0),
+                )
+                status = "Accepted" if ok else "Rejected"
+                await self._connection.send(json.dumps([3, unique_id, {"status": status}]))
+
+            elif action == "Reset":
+                _LOGGER.info(f"[{self.service_id}] Reset requested by backend — not yet forwarded")
+                await self._connection.send(json.dumps([3, unique_id, {"status": "Rejected"}]))
+
+            else:
+                _LOGGER.debug(f"[{self.service_id}] Unhandled backend command: {action}")
+                await self._connection.send(json.dumps([3, unique_id, {"status": "NotImplemented"}]))
+
+        except Exception:
+            _LOGGER.exception(f"[{self.service_id}] Error handling backend command {action}")
+            await self._connection.send(
+                json.dumps([4, unique_id, "InternalError", "Command failed", {}])
+            )
+
     async def start(self) -> None:
         """Listen for incoming commands from the backend OCPP server."""
         try:
@@ -43,8 +96,12 @@ class RawOCPPServiceClient:
                     msg = json.loads(raw_msg)
                     if not isinstance(msg, list) or len(msg) < 3:
                         continue
-                    if msg[0] == 2:  # CALL from backend — acknowledge with empty response
-                        await self._connection.send(json.dumps([3, msg[1], {}]))
+                    if msg[0] == 2:  # CALL from backend
+                        unique_id = msg[1]
+                        action = msg[2]
+                        call_payload = msg[3] if len(msg) > 3 else {}
+                        _LOGGER.info(f"[{self.service_id}] Backend command: {action}")
+                        await self._handle_backend_call(unique_id, action, call_payload)
                 except Exception:
                     _LOGGER.debug(f"[{self.service_id}] Error parsing backend message")
         except Exception:
@@ -121,7 +178,7 @@ class OCPPServiceManager:
             )
 
             # Create raw OCPP service client
-            client = RawOCPPServiceClient(service_id, connection, version)
+            client = RawOCPPServiceClient(service_id, connection, version, service_manager=self)
             self.services[service_id] = client
 
             # Start the client in a background task
