@@ -1,4 +1,3 @@
-import asyncio
 import datetime
 from typing import Any
 
@@ -32,14 +31,8 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         return "1.6"
 
     async def start(self) -> None:
-        """Initiate the BootNotification sequence and handle incoming messages."""
-        # Send BootNotification to charger (as charge point)
-        await self.call_boot_notification(
-            charge_point_model="EVProxy", charge_point_vendor="OCPPProxy"
-        )
-        # Keep the listener alive
-        while True:
-            await asyncio.sleep(1)
+        """Start the OCPP message handler loop (CSMS role)."""
+        await OCPPChargePoint.start(self)
 
     async def send_remote_start_transaction(self, connector_id: int, id_tag: str) -> bool:
         """Send RemoteStartTransaction command to charger."""

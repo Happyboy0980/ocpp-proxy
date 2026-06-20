@@ -18,7 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 
 async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     """Handle WebSocket connection from the EV charger (CSMS role)."""
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(protocols=("ocpp1.6", "ocpp2.0.1"))
     await ws.prepare(request)
 
     # Derive charge point ID from the URL path (e.g. /EVB-P20286478/EVB-P20286478)
