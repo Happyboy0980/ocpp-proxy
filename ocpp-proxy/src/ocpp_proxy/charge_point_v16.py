@@ -4,7 +4,7 @@ from typing import Any
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as OCPPChargePoint
 from ocpp.v16 import call, call_result
-from ocpp.v16.enums import AuthorizationStatus, RegistrationStatus
+from ocpp.v16.enums import AuthorizationStatus, DataTransferStatus, RegistrationStatus
 
 from .charge_point_base import ChargePointBase
 
@@ -51,6 +51,17 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         except Exception:
             return False
         return True
+
+    @on("DataTransfer")  # type: ignore[misc]
+    async def on_data_transfer(
+        self,
+        vendor_id: str,
+        message_id: str = "",
+        data: str = "",
+        **kwargs: Any,
+    ) -> call_result.DataTransfer:
+        """Accept proprietary DataTransfer messages from the charger."""
+        return call_result.DataTransfer(status=DataTransferStatus.accepted)
 
     @on("BootNotification")  # type: ignore[misc]
     async def on_boot_notification(
