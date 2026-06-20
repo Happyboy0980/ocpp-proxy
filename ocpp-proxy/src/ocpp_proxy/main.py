@@ -21,9 +21,13 @@ async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
+    # Derive charge point ID from the URL path (e.g. /EVB-P20286478/EVB-P20286478)
+    path_segments = [p for p in request.path.split("/") if p]
+    cp_id = path_segments[-1] if path_segments else "CP-1"
+
     config = request.app["config"]
     cp = ChargePointFactory.create_charge_point(
-        "CP-1",
+        cp_id,
         ws,
         version=config.ocpp_version,
         manager=request.app["backend_manager"],
@@ -207,6 +211,7 @@ async def init_app() -> web.Application:
             web.get("/sessions.csv", sessions_csv),
             web.get("/status", status_handler),
             web.post("/override", override_handler),
+            web.get("/{path_info:.*}", charger_handler),
         ]
     )
     return app
