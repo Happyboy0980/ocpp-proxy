@@ -295,12 +295,11 @@ async def init_app() -> web.Application:
     app["ha_bridge"] = ha
     app["event_logger"] = EventLogger(db_path=os.getenv("LOG_DB_PATH", "usage_log.db"))
     app["ocpp_service_manager"] = ocpp_service_manager
+    # Pre-initialise so handlers can update it without triggering aiohttp deprecation warnings
+    app["charge_point"] = None
 
     # Set app reference for backend manager
     app["backend_manager"].set_app_reference(app)
-
-    # Start OCPP service connections
-    await ocpp_service_manager.start_services()
 
     app.add_routes(
         [
@@ -314,7 +313,16 @@ async def init_app() -> web.Application:
             web.get("/{path_info:.*}", charger_handler),
         ]
     )
+
+    # on_startup runs inside web.run_app()'s event loop, so service tasks survive
+    app.on_startup.append(startup_app)
+    app.on_cleanup.append(cleanup_app)
     return app
+
+
+async def startup_app(app: web.Application) -> None:
+    """Start outbound OCPP service connections after the web server is running."""
+    await app["ocpp_service_manager"].start_services()
 
 
 async def cleanup_app(app: web.Application) -> None:
@@ -326,9 +334,7 @@ async def cleanup_app(app: web.Application) -> None:
 def main() -> None:
     """Entrypoint for the proxy server."""
     logging.basicConfig(level=logging.INFO)
-    app = asyncio.run(init_app())
-    # Add cleanup handler
-    app.on_cleanup.append(cleanup_app)
+    app = asyncio.get_event_loop().run_until_complete(init_app())
     web.run_app(app, port=int(os.getenv("PORT", 9000)))
 
 
