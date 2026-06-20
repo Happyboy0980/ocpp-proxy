@@ -152,7 +152,7 @@ class OCPPServiceManager:
             # Create WebSocket connection
             connection = await websockets.connect(
                 url,
-                extra_headers=auth_headers,
+                additional_headers=auth_headers,
                 subprotocols=subprotocols,
                 ping_interval=30,
                 ping_timeout=10,
