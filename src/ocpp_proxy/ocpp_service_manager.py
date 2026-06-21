@@ -115,7 +115,7 @@ class OCPPServiceManager:
         self._connection_tasks: dict[str, asyncio.Task[Any]] = {}
 
     async def start_services(self) -> None:
-        """Start connections to all configured OCPP services."""
+        """Start connections to all configured OCPP services (with auto-reconnect)."""
         if not hasattr(self.config, "ocpp_services"):
             _LOGGER.info("No OCPP services configured")
             return
@@ -123,94 +123,123 @@ class OCPPServiceManager:
         for service_config in self.config.ocpp_services:
             service_id = service_config.get("id")
             if service_id and service_config.get("enabled", True):
+                task = asyncio.create_task(
+                    self._run_service_with_reconnect(service_id, service_config)
+                )
+                self._connection_tasks[service_id] = task
+
+    async def _run_service_with_reconnect(
+        self, service_id: str, service_config: dict[str, Any]
+    ) -> None:
+        """Persistent reconnect loop — keeps reconnecting until the task is cancelled."""
+        retry_delay = 5
+        max_retry_delay = 60
+
+        while True:
+            try:
                 await self.connect_service(service_id, service_config)
+                retry_delay = 5  # reset backoff after a successful (clean) disconnect
+            except asyncio.CancelledError:
+                _LOGGER.info("[%s] Service task cancelled", service_id)
+                return
+            except Exception as exc:
+                _LOGGER.warning("[%s] Connection error: %s", service_id, exc)
+
+            if service_id in self.services:
+                self.services[service_id].connected = False
+
+            _LOGGER.info("[%s] Reconnecting in %ds...", service_id, retry_delay)
+            try:
+                await asyncio.sleep(retry_delay)
+            except asyncio.CancelledError:
+                _LOGGER.info("[%s] Service task cancelled during reconnect wait", service_id)
+                return
+            retry_delay = min(retry_delay * 2, max_retry_delay)
 
     async def connect_service(self, service_id: str, service_config: dict[str, Any]) -> None:
-        """Connect to a specific OCPP service."""
+        """Connect to a specific OCPP service and block until the connection closes."""
+        url = service_config.get("url")
+        if not url:
+            _LOGGER.error("No URL configured for OCPP service %s", service_id)
+            return
+
+        version = service_config.get("version", "1.6")
+
+        auth_headers: dict[str, str] = {}
+        if service_config.get("auth_type") == "basic":
+            username = service_config.get("username")
+            password = service_config.get("password")
+            if username and password:
+                import base64
+                credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+                auth_headers["Authorization"] = f"Basic {credentials}"
+        elif service_config.get("auth_type") == "token":
+            token = service_config.get("token")
+            if token:
+                auth_headers["Authorization"] = f"Bearer {token}"
+
+        subprotocols: list[Subprotocol] = []
+        if version == "1.6":
+            subprotocols = [cast("Subprotocol", "ocpp1.6")]
+        elif version == "2.0.1":
+            subprotocols = [cast("Subprotocol", "ocpp2.0.1")]
+
+        # connect() raises on failure — caller (_run_service_with_reconnect) retries
+        connection = await websockets.connect(
+            url,
+            additional_headers=auth_headers,
+            subprotocols=subprotocols,
+            ping_interval=30,
+            ping_timeout=10,
+        )
+
+        client = RawOCPPServiceClient(service_id, connection, version, service_manager=self)
+        self.services[service_id] = client
+
+        _LOGGER.info("Connecting to OCPP %s service %s at %s", version, service_id, url)
+
+        # Replay last known charger state so the backend can initialise its entities
         try:
-            url = service_config.get("url")
-            if not url:
-                _LOGGER.error(f"No URL configured for OCPP service {service_id}")
-                return
-
-            # Determine OCPP version (default to 1.6 if not specified)
-            version = service_config.get("version", "1.6")
-
-            # Handle authentication
-            auth_headers = {}
-            if service_config.get("auth_type") == "basic":
-                username = service_config.get("username")
-                password = service_config.get("password")
-                if username and password:
-                    import base64
-
-                    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-                    auth_headers["Authorization"] = f"Basic {credentials}"
-            elif service_config.get("auth_type") == "token":
-                token = service_config.get("token")
-                if token:
-                    auth_headers["Authorization"] = f"Bearer {token}"
-
-            # Set WebSocket subprotocol based on version
-            subprotocols: list[Subprotocol] = []
-            if version == "1.6":
-                subprotocols = [cast("Subprotocol", "ocpp1.6")]
-            elif version == "2.0.1":
-                subprotocols = [cast("Subprotocol", "ocpp2.0.1")]
-
-            # Create WebSocket connection
-            connection = await websockets.connect(
-                url,
-                additional_headers=auth_headers,
-                subprotocols=subprotocols,
-                ping_interval=30,
-                ping_timeout=10,
-            )
-
-            # Create raw OCPP service client
-            client = RawOCPPServiceClient(service_id, connection, version, service_manager=self)
-            self.services[service_id] = client
-
-            # Start the client in a background task
-            task = asyncio.create_task(client.start())
-            self._connection_tasks[service_id] = task
-
-            _LOGGER.info(f"Connecting to OCPP {version} service {service_id} at {url}")
-
-            # If charger is already online, replay its last BootNotification and
-            # StatusNotification so the backend service initialises correctly
-            try:
-                cp = self.backend_manager._app["state"].get("charge_point")
-                if cp and getattr(cp, "last_boot_payload", None):
-                    await client.send_raw(
-                        json.dumps([2, str(uuid.uuid4()), "BootNotification", cp.last_boot_payload])
-                    )
-                if cp and getattr(cp, "last_status_payload", None):
-                    await client.send_raw(
-                        json.dumps([2, str(uuid.uuid4()), "StatusNotification", cp.last_status_payload])
-                    )
-            except Exception:
-                _LOGGER.debug(f"[{service_id}] Could not replay boot/status to new service")
-
+            cp = self.backend_manager._app["state"].get("charge_point")
+            if cp and getattr(cp, "last_boot_payload", None):
+                await client.send_raw(
+                    json.dumps([2, str(uuid.uuid4()), "BootNotification", cp.last_boot_payload])
+                )
+            if cp and getattr(cp, "last_status_payload", None):
+                await client.send_raw(
+                    json.dumps([2, str(uuid.uuid4()), "StatusNotification", cp.last_status_payload])
+                )
         except Exception:
-            _LOGGER.exception(f"Failed to connect to OCPP service {service_id}")
+            _LOGGER.debug("[%s] Could not replay boot/status to new service", service_id)
+
+        try:
+            await client.start()  # blocks until the connection closes
+        finally:
+            client.connected = False
+            _LOGGER.info("Disconnected from OCPP service %s", service_id)
+            try:
+                await connection.close()
+            except Exception:
+                pass
 
     async def disconnect_service(self, service_id: str) -> None:
-        """Disconnect from a specific OCPP service."""
+        """Disconnect from a specific OCPP service and stop its reconnect loop."""
+        # Cancel the reconnect loop task — this also stops any active connection
+        if service_id in self._connection_tasks:
+            self._connection_tasks[service_id].cancel()
+            del self._connection_tasks[service_id]
+
         if service_id in self.services:
             client = self.services[service_id]
-
-            # Cancel connection task
-            if service_id in self._connection_tasks:
-                self._connection_tasks[service_id].cancel()
-                del self._connection_tasks[service_id]
-
-            # Close WebSocket connection
+            client.connected = False
+            # Close the underlying WebSocket if still open
             if hasattr(client, "_connection"):
-                await client._connection.close()
-
+                try:
+                    await client._connection.close()
+                except Exception:
+                    pass
             del self.services[service_id]
-            _LOGGER.info(f"Disconnected from OCPP service {service_id}")
+            _LOGGER.info("Disconnected from OCPP service %s", service_id)
 
     async def request_control_from_service(
         self, service_id: str, action: str, params: dict[str, Any]
