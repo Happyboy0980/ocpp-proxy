@@ -212,10 +212,23 @@ class ChargePointV16(ChargePointBase, OCPPChargePoint):
         self, connector_id: int, meter_value: list[Any], **kwargs: Any
     ) -> call_result.MeterValues:
         """Handle MeterValues and broadcast meter readings."""
-        # Store with camelCase key so replay is valid OCPP JSON (sampledValue not sampled_value)
+        # The ocpp library delivers all keys in snake_case.  Convert recursively back to
+        # camelCase so the replayed payload is valid OCPP JSON (sampledValue, not sampled_value).
+        def _snake_to_camel(key: str) -> str:
+            parts = key.split("_")
+            return parts[0] + "".join(w.capitalize() for w in parts[1:])
+
+        def _convert(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {_snake_to_camel(k): _convert(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_convert(item) for item in obj]
+            return obj
+
+        camel_meter_value = _convert(meter_value)
         self.last_meter_payload = {
             "connectorId": connector_id,
-            "meterValue": meter_value,
+            "meterValue": camel_meter_value,
         }
         self._persist_state()
         event = {
