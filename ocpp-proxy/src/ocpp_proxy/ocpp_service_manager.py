@@ -37,6 +37,12 @@ class RawOCPPServiceClient:
         self.version = version
         self.connected = True
         self._service_manager = service_manager
+        # Maps UUID of forwarded StartTransaction → idTag, so we can capture the
+        # service's transactionId from its response.
+        self._pending_start_tx: dict[str, str] = {}
+        # Maps idTag → service-assigned transactionId for the active transaction.
+        # Used to remap StopTransaction before forwarding.
+        self._active_txn_ids: dict[str, int] = {}
 
     def _get_adapter(self) -> Any:
         """Return the AiohttpWSAdapter for the currently connected charger, or None."""
@@ -47,8 +53,34 @@ class RawOCPPServiceClient:
             return None
 
     async def send_raw(self, raw_msg: str) -> None:
-        """Forward a raw OCPP message (from the charger) to this backend service."""
+        """Forward a raw OCPP message (from the charger) to this backend service.
+
+        For StartTransaction CALLs the UUID is recorded so we can capture the
+        service's transactionId from its response.
+        For StopTransaction CALLs the transactionId is remapped to the one the
+        service assigned (if known), so the service can close the right session.
+        """
         try:
+            msg = json.loads(raw_msg)
+            if isinstance(msg, list) and msg[0] == 2 and len(msg) >= 4:
+                action = msg[2]
+                unique_id = msg[1]
+                payload = msg[3]
+                if action == "StartTransaction":
+                    id_tag = payload.get("idTag", "")
+                    self._pending_start_tx[unique_id] = id_tag
+                elif action == "StopTransaction":
+                    id_tag = payload.get("idTag", "")
+                    if id_tag in self._active_txn_ids:
+                        service_txn_id = self._active_txn_ids.pop(id_tag)
+                        payload = dict(payload)
+                        payload["transactionId"] = service_txn_id
+                        msg = [msg[0], unique_id, action, payload]
+                        raw_msg = json.dumps(msg)
+                        _LOGGER.debug(
+                            "[%s] remapped StopTransaction txnId to service id %s",
+                            self.service_id, service_txn_id,
+                        )
             _LOGGER.debug("[%s] charger→service: %s", self.service_id, raw_msg)
             await self._connection.send(raw_msg)
         except Exception:
@@ -92,7 +124,21 @@ class RawOCPPServiceClient:
                             await self._connection.send(
                                 json.dumps([3, unique_id, {"status": "Rejected"}])
                             )
-                    # msg_type 3 / 4: responses to our forwarded events — discard silently
+                    # msg_type 3 / 4: responses to our forwarded events.
+                    # Intercept StartTransaction responses to capture the service's
+                    # transactionId; discard everything else silently.
+                    elif msg_type == 3:
+                        unique_id = msg[1]
+                        if unique_id in self._pending_start_tx:
+                            id_tag = self._pending_start_tx.pop(unique_id)
+                            response_payload = msg[2] if len(msg) > 2 else {}
+                            service_txn_id = response_payload.get("transactionId")
+                            if service_txn_id is not None and id_tag:
+                                self._active_txn_ids[id_tag] = service_txn_id
+                                _LOGGER.debug(
+                                    "[%s] captured service transactionId %s for idTag %s",
+                                    self.service_id, service_txn_id, id_tag,
+                                )
                 except Exception:
                     _LOGGER.debug(f"[{self.service_id}] Error parsing backend message")
         except Exception:
